@@ -308,27 +308,32 @@ int main(int argc, char **argv)
 
     if (cfg.btf_path) {
         fprintf(stderr, "using custom BTF: %s\n", cfg.btf_path);
-        libbpf_set_custom_btf_path(cfg.btf_path);
     } else if (!file_exists("/sys/kernel/btf/vmlinux")) {
-#ifdef USE_EMBEDDED_BTF
+    #ifdef USE_EMBEDDED_BTF
         fprintf(stderr, "system BTF not found, trying embedded BTF...\n");
         cfg.btf_path = extract_embedded_btf();
         if (cfg.btf_path) {
-            libbpf_set_custom_btf_path(cfg.btf_path);
             btf_temp_file = true;
         }
-#else
+    #else
         fprintf(stderr, "warning: system BTF not found and no embedded BTF available\n");
-#endif
+    #endif
     }
 
-    skel = hideport_bpf__open();
+    if (cfg.btf_path) {
+        DECLARE_LIBBPF_OPTS(bpf_object_open_opts, open_opts,
+            .btf_custom_path = cfg.btf_path,
+        );
+        skel = hideport_bpf__open_opts(&open_opts);
+    } else {
+        skel = hideport_bpf__open();
+    }
+
     if (!skel) {
         fprintf(stderr, "failed to open BPF skeleton\n");
         err = 1;
         goto cleanup;
     }
-
     err = hideport_bpf__load(skel);
     if (err) {
         fprintf(stderr, "failed to load BPF object: %d\n", err);
