@@ -62,6 +62,23 @@ LIBBPF_LIBDIR="${LIBBPF_LIBDIR:-$LIBBPF_SRC/src}"
 
 mkdir -p "$OUT"
 
+# Handle embedded BTF
+EMBED_BTF_FLAG=""
+BTF_FILE=""
+if [[ -f "$ROOT/btf/vmlinux.btf" ]]; then
+    BTF_FILE="btf/vmlinux.btf"
+elif [[ -f "$ROOT/vmlinux.btf" ]]; then
+    mkdir -p "$ROOT/btf"
+    cp "$ROOT/vmlinux.btf" "$ROOT/btf/vmlinux.btf"
+    BTF_FILE="btf/vmlinux.btf"
+fi
+
+if [[ -n "$BTF_FILE" ]]; then
+    echo "Found vmlinux.btf, generating embedded BTF header..."
+    (cd "$ROOT" && xxd -i "$BTF_FILE") > "$SRC/vmlinux_btf.h"
+    EMBED_BTF_FLAG="-DUSE_EMBEDDED_BTF"
+fi
+
 "$BPF_CC" -target bpf -D__TARGET_ARCH_arm64 -g -O2 \
     -I"$SRC" \
     -I"$LIBBPF_HEADERS" \
@@ -71,6 +88,7 @@ mkdir -p "$OUT"
 "$BPFTOOL" gen skeleton "$OUT/hideport.bpf.o" > "$SRC/hideport.skel.h"
 
 "$TARGET_CC" -O2 -Wall -Wextra -static \
+    $EMBED_BTF_FLAG \
     -I"$SRC" \
     -I"$LIBBPF_HEADERS" \
     -L"$LIBBPF_LIBDIR" \

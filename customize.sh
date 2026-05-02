@@ -43,7 +43,8 @@ check_kernel_btf() {
     fi
 
     if [ ! -r "$current_btf" ]; then
-        abort "! Cannot read $current_btf on this device"
+        ui_print "- System BTF not found; will use embedded BTF fallback if available"
+        return 0
     fi
 
     actual="$(calc_sha256 "$current_btf")" || abort "! Failed to calculate current kernel BTF fingerprint"
