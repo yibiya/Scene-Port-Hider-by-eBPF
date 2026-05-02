@@ -109,7 +109,14 @@ fi
 
 wait_for_process_if_requested
 
+BTF="$MODDIR/btf/vmlinux.btf"
+[ -f "$MODDIR/vmlinux.btf" ] && BTF="$MODDIR/vmlinux.btf"
+
 ARGS=""
+if [ -f "$BTF" ]; then
+    ARGS="$ARGS --btf $BTF"
+fi
+
 for port in $PORTS; do
     ARGS="$ARGS --port $port"
 done
