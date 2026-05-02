@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+set -x
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$ROOT/src"
@@ -9,7 +10,7 @@ ANDROID_API="${ANDROID_API:-26}"
 ANDROID_NDK="${ANDROID_NDK:-${ANDROID_NDK_HOME:-}}"
 LIBBPF_SRC="${LIBBPF_SRC:-}"
 BPF_CC="${BPF_CC:-clang}"
-BPFTOOL="${BPFTOOL:-${BPFOOL:-bpftool}}"
+BPFTOOL="${BPFTOOL:-bpftool}"
 TARGET_CC="${TARGET_CC:-}"
 VMLINUX_H="${VMLINUX_H:-$SRC/vmlinux.h}"
 EXTRA_LDLIBS="${EXTRA_LDLIBS:-}"
