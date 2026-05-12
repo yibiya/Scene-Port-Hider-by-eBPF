@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
-set -x
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$ROOT/src"
@@ -10,7 +9,7 @@ ANDROID_API="${ANDROID_API:-26}"
 ANDROID_NDK="${ANDROID_NDK:-${ANDROID_NDK_HOME:-}}"
 LIBBPF_SRC="${LIBBPF_SRC:-}"
 BPF_CC="${BPF_CC:-clang}"
-BPFTOOL="${BPFTOOL:-bpftool}"
+BPFTOOL="${BPFTOOL:-${BPFOOL:-bpftool}}"
 TARGET_CC="${TARGET_CC:-}"
 VMLINUX_H="${VMLINUX_H:-$SRC/vmlinux.h}"
 EXTRA_LDLIBS="${EXTRA_LDLIBS:-}"
@@ -63,23 +62,6 @@ LIBBPF_LIBDIR="${LIBBPF_LIBDIR:-$LIBBPF_SRC/src}"
 
 mkdir -p "$OUT"
 
-# Handle embedded BTF
-EMBED_BTF_FLAG=""
-BTF_FILE=""
-if [[ -f "$ROOT/btf/vmlinux.btf" ]]; then
-    BTF_FILE="btf/vmlinux.btf"
-elif [[ -f "$ROOT/vmlinux.btf" ]]; then
-    mkdir -p "$ROOT/btf"
-    cp "$ROOT/vmlinux.btf" "$ROOT/btf/vmlinux.btf"
-    BTF_FILE="btf/vmlinux.btf"
-fi
-
-if [[ -n "$BTF_FILE" ]]; then
-    echo "Found vmlinux.btf, generating embedded BTF header..."
-    (cd "$ROOT" && xxd -i "$BTF_FILE") > "$SRC/vmlinux_btf.h"
-    EMBED_BTF_FLAG="-DUSE_EMBEDDED_BTF"
-fi
-
 "$BPF_CC" -target bpf -D__TARGET_ARCH_arm64 -g -O2 \
     -I"$SRC" \
     -I"$LIBBPF_HEADERS" \
@@ -90,6 +72,20 @@ fi
 
 "$TARGET_CC" -O2 -Wall -Wextra -static \
     $EMBED_BTF_FLAG \
+    -I"$SRC" \
+    -I"$LIBBPF_HEADERS" \
+    -L"$LIBBPF_LIBDIR" \
+    -o "$OUT/hideport_loader" \
+    "$SRC/hideport_loader.c" \
+    "$SRC/tls_align.S" \
+    -lbpf -lelf -lz $EXTRA_LDLIBS
+
+chmod 0755 "$OUT/hideport_loader" 2>/dev/null || \
+    echo "Warning: could not chmod $OUT/hideport_loader; this is normal on some /mnt/* WSL mounts."
+echo "Built $OUT/hideport_loader and $OUT/hideport.bpf.o"
+eport.skel.h"
+
+"$TARGET_CC" -O2 -Wall -Wextra -static \
     -I"$SRC" \
     -I"$LIBBPF_HEADERS" \
     -L"$LIBBPF_LIBDIR" \

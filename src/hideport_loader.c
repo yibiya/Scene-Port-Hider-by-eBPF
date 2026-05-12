@@ -3,6 +3,7 @@
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -10,24 +11,19 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
-#include <sys/stat.h>
 #include <unistd.h>
-
-#ifdef USE_EMBEDDED_BTF
-#include "vmlinux_btf.h"
-#endif
 
 #include "hideport.skel.h"
 
 #define MAX_PORTS 16
 #define MAX_UIDS 32
+#define CGROUP_PATH "/sys/fs/cgroup"
 
 struct config {
     uint16_t ports[MAX_PORTS];
     int port_count;
     uint32_t uids[MAX_UIDS];
     int uid_count;
-    char *btf_path;
 };
 
 static volatile sig_atomic_t exiting;
@@ -41,10 +37,10 @@ static void sig_handler(int sig)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-            "Usage: %s [--port PORT]... [--uid UID]... [--btf BTF_PATH] [UID...]\n"
+            "Usage: %s [--port PORT]... [--uid UID]... [UID...]\n"
             "\n"
             "Default hidden ports: 8788, 8765.\n"
-            "Default allowed UIDs: 0, 1000.\n"
+            "Default allowed UIDs: 0, 1000, 2000.\n"
             "Bare numeric arguments are treated as UID whitelist entries.\n",
             argv0);
 }
@@ -94,6 +90,7 @@ static int parse_args(int argc, char **argv, struct config *cfg)
     add_port(cfg, 8765);
     add_uid(cfg, 0);
     add_uid(cfg, 1000);
+    add_uid(cfg, 2000);
 
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
@@ -152,18 +149,6 @@ static int parse_args(int argc, char **argv, struct config *cfg)
             continue;
         }
 
-        if (!strcmp(arg, "--btf")) {
-            if (++i >= argc)
-                return -EINVAL;
-            cfg->btf_path = strdup(argv[i]);
-            continue;
-        }
-
-        if (!strncmp(arg, "--btf=", 6)) {
-            cfg->btf_path = strdup(arg + 6);
-            continue;
-        }
-
         if (parse_ulong(arg, UINT32_MAX, &value) || add_uid(cfg, value))
             return -EINVAL;
     }
@@ -186,17 +171,18 @@ static int bump_memlock_rlimit(void)
 
 static int setup_ports(struct hideport_bpf *skel, const struct config *cfg)
 {
-    __u8 value = 1;
+    __u8 net_value = 1;
 
     for (int i = 0; i < cfg->port_count; i++) {
-        __u16 key = htons(cfg->ports[i]);
+        __u16 net_key = htons(cfg->ports[i]);
 
         if (bpf_map_update_elem(bpf_map__fd(skel->maps.target_ports),
-                                &key, &value, BPF_ANY)) {
+                                &net_key, &net_value, BPF_ANY)) {
             fprintf(stderr, "failed to add port %u: %s\n",
                     cfg->ports[i], strerror(errno));
             return -errno;
         }
+
         fprintf(stderr, "hidden port: %u\n", cfg->ports[i]);
     }
 
@@ -222,57 +208,161 @@ static int setup_uids(struct hideport_bpf *skel, const struct config *cfg)
     return 0;
 }
 
-static struct bpf_link *try_attach_symbols(struct bpf_program *prog,
-                                           const char *const *symbols,
-                                           size_t count,
-                                           const char *kind)
+static int attach_cgroup_connect_prog(struct bpf_program *prog,
+                                      int cgroup_fd,
+                                      enum bpf_attach_type attach_type,
+                                      const char *name)
 {
-    for (size_t i = 0; i < count; i++) {
-        struct bpf_link *link;
-        long err;
+    int prog_fd = bpf_program__fd(prog);
 
-        link = bpf_program__attach_kprobe(prog, false, symbols[i]);
-        err = libbpf_get_error(link);
-        if (!err) {
-            fprintf(stderr, "attached %s probe to %s\n", kind, symbols[i]);
-            return link;
+    if (prog_fd < 0) {
+        fprintf(stderr, "invalid %s program fd\n", name);
+        return -EINVAL;
+    }
+
+    if (!bpf_prog_attach(prog_fd, cgroup_fd, attach_type, BPF_F_ALLOW_MULTI)) {
+        fprintf(stderr, "attached %s to %s with allow-multi\n",
+                name, CGROUP_PATH);
+        return 0;
+    }
+
+    if (!bpf_prog_attach(prog_fd, cgroup_fd, attach_type, 0)) {
+        fprintf(stderr, "attached %s to %s with legacy single attach\n",
+                name, CGROUP_PATH);
+        return 0;
+    }
+
+    fprintf(stderr, "attach %s to %s failed: %s\n",
+            name, CGROUP_PATH, strerror(errno));
+    return -errno;
+}
+
+static void detach_cgroup_connect_prog(struct bpf_program *prog,
+                                       int cgroup_fd,
+                                       enum bpf_attach_type attach_type,
+                                       const char *name)
+{
+    int prog_fd;
+
+    if (cgroup_fd < 0)
+        return;
+
+    prog_fd = bpf_program__fd(prog);
+    if (prog_fd < 0)
+        return;
+
+    if (bpf_prog_detach2(prog_fd, cgroup_fd, attach_type)) {
+        fprintf(stderr, "detach %s from %s failed: %s\n",
+                name, CGROUP_PATH, strerror(errno));
+    }
+}
+
+static int attach_getsockname_pair(struct bpf_program *entry_prog,
+                                   struct bpf_program *ret_prog,
+                                   const char *symbol,
+                                   struct bpf_link **entry_link,
+                                   struct bpf_link **ret_link)
+{
+    struct bpf_link *entry = NULL;
+    struct bpf_link *ret = NULL;
+    long err;
+
+    entry = bpf_program__attach_kprobe(entry_prog, false, symbol);
+    err = libbpf_get_error(entry);
+    if (err) {
+        fprintf(stderr, "attach getsockname entry probe to %s failed: %ld (%s)\n",
+                symbol, err, strerror((int)-err));
+        return (int)err;
+    }
+
+    ret = bpf_program__attach_kprobe(ret_prog, true, symbol);
+    err = libbpf_get_error(ret);
+    if (err) {
+        fprintf(stderr, "attach getsockname ret probe to %s failed: %ld (%s)\n",
+                symbol, err, strerror((int)-err));
+        bpf_link__destroy(entry);
+        return (int)err;
+    }
+
+    fprintf(stderr, "attached getsockname probes to %s\n", symbol);
+    *entry_link = entry;
+    *ret_link = ret;
+    return 0;
+}
+
+static int attach_getsockname_probes(struct hideport_bpf *skel,
+                                     struct bpf_link **entry_link,
+                                     struct bpf_link **ret_link)
+{
+    static const char *const direct_symbols[] = {
+        "__sys_getsockname",
+        "__se_sys_getsockname",
+        "sys_getsockname",
+        "SyS_getsockname",
+    };
+    static const char *const arm64_symbols[] = {
+        "__arm64_sys_getsockname",
+    };
+
+    for (size_t i = 0; i < sizeof(direct_symbols) / sizeof(direct_symbols[0]); i++) {
+        if (!attach_getsockname_pair(skel->progs.hideport_getsockname_entry_direct,
+                                     skel->progs.hideport_getsockname_ret,
+                                     direct_symbols[i],
+                                     entry_link,
+                                     ret_link)) {
+            return 0;
         }
-
-        fprintf(stderr, "attach %s probe to %s failed: %ld (%s)\n",
-                kind, symbols[i], err, strerror((int)-err));
     }
 
-    return NULL;
+    for (size_t i = 0; i < sizeof(arm64_symbols) / sizeof(arm64_symbols[0]); i++) {
+        if (!attach_getsockname_pair(skel->progs.hideport_getsockname_entry_arm64,
+                                     skel->progs.hideport_getsockname_ret,
+                                     arm64_symbols[i],
+                                     entry_link,
+                                     ret_link)) {
+            return 0;
+        }
+    }
+
+    return -ENOENT;
 }
 
-static bool file_exists(const char *path)
+static int attach_bind_pair(struct bpf_program *entry_prog,
+                            struct bpf_program *ret_prog,
+                            const char *symbol,
+                            struct bpf_link **entry_link,
+                            struct bpf_link **ret_link)
 {
-    struct stat st;
-    return stat(path, &st) == 0;
+    struct bpf_link *entry = NULL;
+    struct bpf_link *ret = NULL;
+    long err;
+
+    entry = bpf_program__attach_kprobe(entry_prog, false, symbol);
+    err = libbpf_get_error(entry);
+    if (err) {
+        fprintf(stderr, "attach bind entry probe to %s failed: %ld (%s)\n",
+                symbol, err, strerror((int)-err));
+        return (int)err;
+    }
+
+    ret = bpf_program__attach_kprobe(ret_prog, true, symbol);
+    err = libbpf_get_error(ret);
+    if (err) {
+        fprintf(stderr, "attach bind ret probe to %s failed: %ld (%s)\n",
+                symbol, err, strerror((int)-err));
+        bpf_link__destroy(entry);
+        return (int)err;
+    }
+
+    fprintf(stderr, "attached bind probes to %s\n", symbol);
+    *entry_link = entry;
+    *ret_link = ret;
+    return 0;
 }
 
-#ifdef USE_EMBEDDED_BTF
-static char *extract_embedded_btf(void)
-{
-    const char *tmp_path = "/data/local/tmp/.vmlinux.btf";
-    FILE *f = fopen(tmp_path, "wb");
-    if (!f) {
-        // Try current directory as fallback
-        tmp_path = "./.vmlinux.btf";
-        f = fopen(tmp_path, "wb");
-    }
-    if (!f) {
-        fprintf(stderr, "failed to extract embedded BTF\n");
-        return NULL;
-    }
-    fwrite(btf_vmlinux_btf, 1, btf_vmlinux_btf_len, f);
-    fclose(f);
-    fprintf(stderr, "extracted embedded BTF to %s\n", tmp_path);
-    return strdup(tmp_path);
-}
-#endif
-
-int main(int argc, char **argv)
+static int attach_bind_probes(struct hideport_bpf *skel,
+                              struct bpf_link **entry_link,
+                              struct bpf_link **ret_link)
 {
     static const char *const direct_symbols[] = {
         "__sys_bind",
@@ -283,11 +373,95 @@ int main(int argc, char **argv)
     static const char *const arm64_symbols[] = {
         "__arm64_sys_bind",
     };
+
+    for (size_t i = 0; i < sizeof(direct_symbols) / sizeof(direct_symbols[0]); i++) {
+        if (!attach_bind_pair(skel->progs.hideport_bind_entry_direct,
+                              skel->progs.hideport_bind_ret,
+                              direct_symbols[i],
+                              entry_link,
+                              ret_link)) {
+            return 0;
+        }
+    }
+
+    for (size_t i = 0; i < sizeof(arm64_symbols) / sizeof(arm64_symbols[0]); i++) {
+        if (!attach_bind_pair(skel->progs.hideport_bind_entry_arm64,
+                              skel->progs.hideport_bind_ret,
+                              arm64_symbols[i],
+                              entry_link,
+                              ret_link)) {
+            return 0;
+        }
+    }
+
+    return -ENOENT;
+}
+
+static struct bpf_link *try_attach_close_symbols(struct bpf_program *prog,
+                                                 const char *const *symbols,
+                                                 size_t count,
+                                                 const char *kind)
+{
+    for (size_t i = 0; i < count; i++) {
+        struct bpf_link *link;
+        long err;
+
+        link = bpf_program__attach_kprobe(prog, false, symbols[i]);
+        err = libbpf_get_error(link);
+        if (!err) {
+            fprintf(stderr, "attached close cleanup probe to %s\n", symbols[i]);
+            return link;
+        }
+
+        fprintf(stderr, "attach close cleanup %s probe to %s failed: %ld (%s)\n",
+                kind, symbols[i], err, strerror((int)-err));
+    }
+
+    return NULL;
+}
+
+static struct bpf_link *attach_optional_close_probe(struct hideport_bpf *skel)
+{
+    static const char *const direct_symbols[] = {
+        "__sys_close",
+        "__se_sys_close",
+        "sys_close",
+        "SyS_close",
+    };
+    static const char *const arm64_symbols[] = {
+        "__arm64_sys_close",
+    };
+    struct bpf_link *link;
+
+    link = try_attach_close_symbols(skel->progs.hideport_close_entry_direct,
+                                    direct_symbols,
+                                    sizeof(direct_symbols) / sizeof(direct_symbols[0]),
+                                    "direct");
+    if (link)
+        return link;
+
+    return try_attach_close_symbols(skel->progs.hideport_close_entry_arm64,
+                                    arm64_symbols,
+                                    sizeof(arm64_symbols) / sizeof(arm64_symbols[0]),
+                                    "arm64 syscall-wrapper");
+}
+
+int main(int argc, char **argv)
+{
     struct config cfg;
     struct hideport_bpf *skel = NULL;
-    struct bpf_link *link = NULL;
+    struct bpf_link *bind_entry_link = NULL;
+    struct bpf_link *bind_ret_link = NULL;
+    struct bpf_link *getsockname_entry_link = NULL;
+    struct bpf_link *getsockname_ret_link = NULL;
+    struct bpf_link *close_link = NULL;
+    int cgroup_fd = -1;
+    int connect4_attached = 0;
+    int connect6_attached = 0;
+    int bind4_attached = 0;
+    int bind6_attached = 0;
+    int bind_rewrite_enabled = 0;
     int err;
-    bool btf_temp_file = false;
 
     err = parse_args(argc, argv, &cfg);
     if (err) {
@@ -306,42 +480,16 @@ int main(int argc, char **argv)
 
     libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 
-    if (cfg.btf_path) {
-        fprintf(stderr, "using custom BTF: %s\n", cfg.btf_path);
-    } else if (!file_exists("/sys/kernel/btf/vmlinux")) {
-    #ifdef USE_EMBEDDED_BTF
-        fprintf(stderr, "system BTF not found, trying embedded BTF...\n");
-        cfg.btf_path = extract_embedded_btf();
-        if (cfg.btf_path) {
-            btf_temp_file = true;
-        }
-    #else
-        fprintf(stderr, "warning: system BTF not found and no embedded BTF available\n");
-    #endif
-    }
-
-    if (cfg.btf_path) {
-        DECLARE_LIBBPF_OPTS(bpf_object_open_opts, open_opts,
-            .btf_custom_path = cfg.btf_path,
-        );
-        skel = hideport_bpf__open_opts(&open_opts);
-    } else {
-        skel = hideport_bpf__open();
-    }
-
+    skel = hideport_bpf__open();
     if (!skel) {
         fprintf(stderr, "failed to open BPF skeleton\n");
-        err = 1;
-        goto cleanup;
+        return 1;
     }
+
     err = hideport_bpf__load(skel);
     if (err) {
         fprintf(stderr, "failed to load BPF object: %d\n", err);
         goto cleanup;
-    }
-
-    if (btf_temp_file && cfg.btf_path) {
-        unlink(cfg.btf_path);
     }
 
     err = setup_ports(skel, &cfg);
@@ -352,24 +500,70 @@ int main(int argc, char **argv)
     if (err)
         goto cleanup;
 
-    link = try_attach_symbols(skel->progs.hideport_bind_direct,
-                              direct_symbols,
-                              sizeof(direct_symbols) / sizeof(direct_symbols[0]),
-                              "direct");
-    if (!link) {
-        link = try_attach_symbols(skel->progs.hideport_bind_arm64_syscall,
-                                  arm64_symbols,
-                                  sizeof(arm64_symbols) / sizeof(arm64_symbols[0]),
-                                  "arm64 syscall-wrapper");
-    }
-
-    if (!link) {
-        fprintf(stderr, "failed to attach any bind kprobe candidate\n");
-        err = 1;
+    cgroup_fd = open(CGROUP_PATH, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (cgroup_fd < 0) {
+        fprintf(stderr, "failed to open %s: %s\n",
+                CGROUP_PATH, strerror(errno));
+        err = -errno;
         goto cleanup;
     }
 
-    fprintf(stderr, "hideport loaded\n");
+    err = attach_cgroup_connect_prog(skel->progs.hideport_connect4,
+                                     cgroup_fd,
+                                     BPF_CGROUP_INET4_CONNECT,
+                                     "connect4");
+    if (err)
+        goto cleanup;
+    connect4_attached = 1;
+
+    err = attach_cgroup_connect_prog(skel->progs.hideport_connect6,
+                                     cgroup_fd,
+                                     BPF_CGROUP_INET6_CONNECT,
+                                     "connect6");
+    if (err)
+        goto cleanup;
+    connect6_attached = 1;
+
+    err = attach_getsockname_probes(skel,
+                                    &getsockname_entry_link,
+                                    &getsockname_ret_link);
+    if (err) {
+        fprintf(stderr, "warning: getsockname probes unavailable; bind rewrite disabled\n");
+        err = 0;
+    } else {
+        err = attach_bind_probes(skel,
+                                 &bind_entry_link,
+                                 &bind_ret_link);
+        if (err) {
+            fprintf(stderr, "warning: bind probes unavailable; bind rewrite disabled\n");
+            err = 0;
+        } else {
+            bind_rewrite_enabled = 1;
+            close_link = attach_optional_close_probe(skel);
+            if (!close_link)
+                fprintf(stderr, "warning: close cleanup probe unavailable; fd state will expire by LRU\n");
+        }
+    }
+
+    if (bind_rewrite_enabled) {
+        err = attach_cgroup_connect_prog(skel->progs.hideport_bind4,
+                                         cgroup_fd,
+                                         BPF_CGROUP_INET4_BIND,
+                                         "bind4");
+        if (err)
+            goto cleanup;
+        bind4_attached = 1;
+
+        err = attach_cgroup_connect_prog(skel->progs.hideport_bind6,
+                                         cgroup_fd,
+                                         BPF_CGROUP_INET6_BIND,
+                                         "bind6");
+        if (err)
+            goto cleanup;
+        bind6_attached = 1;
+    }
+
+    fprintf(stderr, "hideport cgroup-connect loaded\n");
     while (!exiting)
         sleep(1);
 
@@ -380,7 +574,52 @@ cleanup:
         unlink(cfg.btf_path);
     }
     free(cfg.btf_path);
-    bpf_link__destroy(link);
+    if (bind6_attached)
+        detach_cgroup_connect_prog(skel->progs.hideport_bind6,
+                                   cgroup_fd,
+                                   BPF_CGROUP_INET6_BIND,
+                                   "bind6");
+    if (bind4_attached)
+        detach_cgroup_connect_prog(skel->progs.hideport_bind4,
+                                   cgroup_fd,
+                                   BPF_CGROUP_INET4_BIND,
+                                   "bind4");
+    if (connect6_attached)
+        detach_cgroup_connect_prog(skel->progs.hideport_connect6,
+                                   cgroup_fd,
+                                   BPF_CGROUP_INET6_CONNECT,
+                                   "connect6");
+    if (connect4_attached)
+        detach_cgroup_connect_prog(skel->progs.hideport_connect4,
+                                   cgroup_fd,
+                                   BPF_CGROUP_INET4_CONNECT,
+                                   "connect4");
+    bpf_link__destroy(close_link);
+    bpf_link__destroy(bind_ret_link);
+    bpf_link__destroy(bind_entry_link);
+    bpf_link__destroy(getsockname_ret_link);
+    bpf_link__destroy(getsockname_entry_link);
+    if (cgroup_fd >= 0)
+        close(cgroup_fd);
+    hideport_bpf__destroy(skel);
+    return err;
+}
+skel->progs.hideport_connect6,
+                                   cgroup_fd,
+                                   BPF_CGROUP_INET6_CONNECT,
+                                   "connect6");
+    if (connect4_attached)
+        detach_cgroup_connect_prog(skel->progs.hideport_connect4,
+                                   cgroup_fd,
+                                   BPF_CGROUP_INET4_CONNECT,
+                                   "connect4");
+    bpf_link__destroy(close_link);
+    bpf_link__destroy(bind_ret_link);
+    bpf_link__destroy(bind_entry_link);
+    bpf_link__destroy(getsockname_ret_link);
+    bpf_link__destroy(getsockname_entry_link);
+    if (cgroup_fd >= 0)
+        close(cgroup_fd);
     hideport_bpf__destroy(skel);
     return err;
 }
