@@ -11,7 +11,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <unistd.h>
+
+#ifdef USE_EMBEDDED_BTF
+#include "vmlinux_btf.h"
+#endif
 
 #include "hideport.skel.h"
 
@@ -24,6 +29,7 @@ struct config {
     int port_count;
     uint32_t uids[MAX_UIDS];
     int uid_count;
+    char *btf_path;
 };
 
 static volatile sig_atomic_t exiting;
@@ -37,7 +43,7 @@ static void sig_handler(int sig)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-            "Usage: %s [--port PORT]... [--uid UID]... [UID...]\n"
+            "Usage: %s [--port PORT]... [--uid UID]... [--btf BTF_PATH] [UID...]\n"
             "\n"
             "Default hidden ports: 8788, 8765.\n"
             "Default allowed UIDs: 0, 1000, 2000.\n"
@@ -146,6 +152,18 @@ static int parse_args(int argc, char **argv, struct config *cfg)
                 return -EINVAL;
             if (add_uid(cfg, value))
                 return -EINVAL;
+            continue;
+        }
+
+        if (!strcmp(arg, "--btf")) {
+            if (++i >= argc)
+                return -EINVAL;
+            cfg->btf_path = strdup(argv[i]);
+            continue;
+        }
+
+        if (!strncmp(arg, "--btf=", 6)) {
+            cfg->btf_path = strdup(arg + 6);
             continue;
         }
 
@@ -446,6 +464,33 @@ static struct bpf_link *attach_optional_close_probe(struct hideport_bpf *skel)
                                     "arm64 syscall-wrapper");
 }
 
+static bool file_exists(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+#ifdef USE_EMBEDDED_BTF
+static char *extract_embedded_btf(void)
+{
+    const char *tmp_path = "/data/local/tmp/.vmlinux.btf";
+    FILE *f = fopen(tmp_path, "wb");
+    if (!f) {
+        // Try current directory as fallback
+        tmp_path = "./.vmlinux.btf";
+        f = fopen(tmp_path, "wb");
+    }
+    if (!f) {
+        fprintf(stderr, "failed to extract embedded BTF\n");
+        return NULL;
+    }
+    fwrite(btf_vmlinux_btf, 1, btf_vmlinux_btf_len, f);
+    fclose(f);
+    fprintf(stderr, "extracted embedded BTF to %s\n", tmp_path);
+    return strdup(tmp_path);
+}
+#endif
+
 int main(int argc, char **argv)
 {
     struct config cfg;
@@ -462,6 +507,7 @@ int main(int argc, char **argv)
     int bind6_attached = 0;
     int bind_rewrite_enabled = 0;
     int err;
+    bool btf_temp_file = false;
 
     err = parse_args(argc, argv, &cfg);
     if (err) {
@@ -480,16 +526,43 @@ int main(int argc, char **argv)
 
     libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 
-    skel = hideport_bpf__open();
+    if (cfg.btf_path) {
+        fprintf(stderr, "using custom BTF: %s\n", cfg.btf_path);
+    } else if (!file_exists("/sys/kernel/btf/vmlinux")) {
+    #ifdef USE_EMBEDDED_BTF
+        fprintf(stderr, "system BTF not found, trying embedded BTF...\n");
+        cfg.btf_path = extract_embedded_btf();
+        if (cfg.btf_path) {
+            btf_temp_file = true;
+        }
+    #else
+        fprintf(stderr, "warning: system BTF not found and no embedded BTF available\n");
+    #endif
+    }
+
+    if (cfg.btf_path) {
+        DECLARE_LIBBPF_OPTS(bpf_object_open_opts, open_opts,
+            .btf_custom_path = cfg.btf_path,
+        );
+        skel = hideport_bpf__open_opts(&open_opts);
+    } else {
+        skel = hideport_bpf__open();
+    }
+
     if (!skel) {
         fprintf(stderr, "failed to open BPF skeleton\n");
-        return 1;
+        err = 1;
+        goto cleanup;
     }
 
     err = hideport_bpf__load(skel);
     if (err) {
         fprintf(stderr, "failed to load BPF object: %d\n", err);
         goto cleanup;
+    }
+
+    if (btf_temp_file && cfg.btf_path) {
+        unlink(cfg.btf_path);
     }
 
     err = setup_ports(skel, &cfg);
@@ -586,25 +659,6 @@ cleanup:
                                    "bind4");
     if (connect6_attached)
         detach_cgroup_connect_prog(skel->progs.hideport_connect6,
-                                   cgroup_fd,
-                                   BPF_CGROUP_INET6_CONNECT,
-                                   "connect6");
-    if (connect4_attached)
-        detach_cgroup_connect_prog(skel->progs.hideport_connect4,
-                                   cgroup_fd,
-                                   BPF_CGROUP_INET4_CONNECT,
-                                   "connect4");
-    bpf_link__destroy(close_link);
-    bpf_link__destroy(bind_ret_link);
-    bpf_link__destroy(bind_entry_link);
-    bpf_link__destroy(getsockname_ret_link);
-    bpf_link__destroy(getsockname_entry_link);
-    if (cgroup_fd >= 0)
-        close(cgroup_fd);
-    hideport_bpf__destroy(skel);
-    return err;
-}
-skel->progs.hideport_connect6,
                                    cgroup_fd,
                                    BPF_CGROUP_INET6_CONNECT,
                                    "connect6");
